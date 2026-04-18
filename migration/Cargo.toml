@@ -1,0 +1,11 @@
+[package]
+name = "plan-migration"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "plan_migration"
+path = "src/lib.rs"
+
+[dependencies]
+sea-orm-migration.workspace = true

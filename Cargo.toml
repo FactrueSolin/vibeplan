@@ -1,0 +1,28 @@
+[workspace]
+members = ["api", "migration"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+axum = { version = "0.8", features = ["macros"] }
+config = "0.15"
+dotenvy = "0.15"
+http = "1.3"
+sea-orm = { version = "1.1", features = ["macros", "runtime-tokio-rustls", "sqlx-sqlite", "with-time"] }
+sea-orm-migration = { version = "1.1", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
+tokio = { version = "1.48", features = ["fs", "macros", "rt-multi-thread", "signal"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+utoipa = { version = "5.4", features = ["axum_extras", "preserve_order", "time", "uuid"] }
+uuid = { version = "1.18", features = ["serde", "v4", "v7"] }
+validator = { version = "0.20", features = ["derive"] }
