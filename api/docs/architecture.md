@@ -94,20 +94,37 @@
 
 ### 4.2 后端
 
-- Web 框架：`axum`
+- HTTP 框架：`axum`
+- 中间件：`tower-http`
 - 异步运行时：`tokio`
 - 数据访问：`sea-orm`
-- 序列化：`serde`
-- 时间处理：`chrono` 或 `time`
-- 唯一 ID：`uuid`
-- 错误处理：`thiserror` + 统一 API 错误映射
-- 日志：`tracing` + `tracing-subscriber`
+- 迁移：`sea-orm-migration`
+- 序列化：`serde` + `serde_json`
+- OpenAPI：`utoipa` + `utoipa-axum`
+- 请求校验：`validator`
+- 时间处理：`time`
+- 唯一 ID：`uuid`，统一使用 `UUID v7`
+- 错误处理：`thiserror`，启动与集成层可局部使用 `anyhow`
+- 日志与追踪：`tracing` + `tracing-subscriber`
+- 配置：`config` + `dotenvy`
 
-选型原因：
+推荐原因：
 
-- `axum` 生态成熟，适合构建清晰的 REST API。
-- `SeaORM` 对 SQLite 支持稳定，实体、关系和迁移工具链完整，适合当前项目从骨架阶段快速落地。
-- 当前项目虽然规模不大，但仍需要清晰的模型定义、迁移管理和事务边界，`SeaORM + repository` 的组合更平衡。
+- `axum + tower-http` 足够轻量，同时能自然承接路由、中间件、请求 ID、CORS、trace 等通用能力。
+- `SeaORM` 对 SQLite 友好，Entity、Relation、Migration 是同一套工具链，适合当前项目从骨架到可维护 V1 的演进路径。
+- `utoipa` 适合和 `axum`、DTO、错误模型一起维护统一的 OpenAPI 契约，能避免接口代码和文档双份漂移。
+- `validator` 适合承接 DTO 层校验，领域规则继续放在 `app service`，职责边界清晰。
+- `time + UUID v7` 有利于统一时间格式与排序语义，避免 `chrono` 和随机 UUID 带来的风格分裂。
+- `tracing` 能直接打通 HTTP 日志、SQL 慢查询、业务事件，后续迁移到多用户或远程部署也不需要推翻。
+
+后端技术选项指导：
+
+- Web 框架优先 `axum`。只有在团队已经深度熟悉 `actix-web`，或者明确需要其生态中的特定能力时，才考虑替换。
+- 数据访问优先 `SeaORM`。如果后续读模型明显变复杂、出现大量手写 SQL 和复杂聚合，再局部引入 `SQLx` 辅助查询，而不是在 V1 直接切换整套方案。
+- 后端接口必须采用 `OpenAPI 3.1`。推荐通过 `utoipa` 从路由、DTO、错误模型自动生成，不再接受只维护 Markdown 而不生成机器可读契约的方案。
+- 后端必须同时提供运行时 `GET /api/v1/openapi.json` 和仓库产物 `api/docs/openapi.json`，两者必须来自同一份 `ApiDoc` 定义。
+- 配置优先环境变量 + `.env` 文件，不引入额外配置中心。
+- V1 不引入 GraphQL、gRPC、消息队列、事件总线、CQRS、缓存中间件。当前系统是单机场景，这些技术会增加心智负担，但不会实质提升交付速度。
 
 ### 4.3 数据库
 
@@ -151,9 +168,11 @@ plan/
 api/src/
 ├── main.rs
 ├── lib.rs
+├── bin/
 ├── config/
 ├── routes/
 ├── dto/
+├── openapi/
 ├── app/
 ├── domain/
 ├── repository/
@@ -165,6 +184,8 @@ api/src/
 
 - `routes/`：HTTP 路由与请求响应映射。
 - `dto/`：API 请求与响应结构体。
+- `bin/`：放置 `export_openapi.rs` 等独立导出或维护型命令。
+- `openapi/`：统一定义 `ApiDoc`、schema 组装和导出逻辑。
 - `app/`：应用服务，负责具体用例编排。
 - `domain/`：领域实体、值对象、业务规则。
 - `repository/`：数据库查询与持久化。
@@ -381,13 +402,18 @@ CREATE TABLE tasks (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
-  FOREIGN KEY (status_id) REFERENCES task_statuses(id) ON DELETE RESTRICT
+  FOREIGN KEY (project_id, status_id)
+    REFERENCES task_statuses(project_id, id)
+    ON DELETE RESTRICT
 );
 ```
 
 建议索引：
 
 ```sql
+CREATE UNIQUE INDEX uq_tasks_project_id_id
+ON tasks(project_id, id);
+
 CREATE INDEX idx_tasks_project_status_position
 ON tasks(project_id, status_id, position);
 
@@ -423,11 +449,17 @@ CREATE TABLE tags (
 );
 
 CREATE TABLE task_tags (
+  project_id TEXT NOT NULL,
   task_id TEXT NOT NULL,
   tag_id TEXT NOT NULL,
   PRIMARY KEY (task_id, tag_id),
-  FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
-  FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+  FOREIGN KEY (project_id, task_id)
+    REFERENCES tasks(project_id, id)
+    ON DELETE CASCADE,
+  FOREIGN KEY (project_id, tag_id)
+    REFERENCES tags(project_id, id)
+    ON DELETE CASCADE
 );
 ```
 
@@ -436,12 +468,18 @@ CREATE TABLE task_tags (
 ```sql
 CREATE TABLE task_relations (
   id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
   task_id TEXT NOT NULL,
   related_task_id TEXT NOT NULL,
   relation_type TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
-  FOREIGN KEY (related_task_id) REFERENCES tasks(id) ON DELETE CASCADE
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+  FOREIGN KEY (project_id, task_id)
+    REFERENCES tasks(project_id, id)
+    ON DELETE CASCADE,
+  FOREIGN KEY (project_id, related_task_id)
+    REFERENCES tasks(project_id, id)
+    ON DELETE CASCADE
 );
 ```
 
@@ -462,68 +500,213 @@ CREATE TABLE activity_logs (
 
 ## 9. API 设计
 
-API 风格采用 REST + JSON。
+API 风格采用 `REST + JSON`，并在 V1 就统一版本、字段命名和错误模型。
+
+OpenAPI 实施标准见 [openapi-standard.md](/var/tmp/vibe-kanban/worktrees/62de-/plan/api/docs/openapi-standard.md)。本章描述的是接口设计约束，最终机器可读契约以自动生成的 `api/docs/openapi.json` 为准。
 
 统一前缀建议：
 
-- 本地开发：`http://localhost:3001/api`
-- 生产部署：由反向代理统一暴露
+- 本地开发：`http://localhost:3001/api/v1`
+- 生产部署：由反向代理统一暴露 `/api/v1/*`
 
-### 9.1 项目接口
+### 9.1 总体规范
 
-- `GET /api/projects`
-- `POST /api/projects`
-- `GET /api/projects/:projectId`
-- `PATCH /api/projects/:projectId`
-- `DELETE /api/projects/:projectId`
+- URL 使用资源名复数，例如 `projects`、`statuses`、`tasks`。
+- JSON 字段统一使用 `camelCase`，数据库字段继续使用 `snake_case`；Rust DTO 统一加 `#[serde(rename_all = "camelCase")]`。
+- 所有公开接口都必须出现在 OpenAPI 中，并通过统一的 `ApiDoc` 自动导出。
+- `id` 统一为字符串型 `UUID v7`。
+- `createdAt`、`updatedAt`、`completedAt`、`archivedAt` 使用 UTC RFC 3339 时间字符串。
+- `startDate`、`dueDate` 使用 `YYYY-MM-DD`，仅表达日期，不表达时区。
+- 成功响应统一返回 `data`，列表接口可额外返回 `meta`。
+- 失败响应统一返回 `error` 对象，包含 `code`、`message`、`details`、`requestId`。
+- `PATCH` 采用部分更新语义，只提交变化字段；字段显式传 `null` 表示清空可空值。
+- 列表接口统一支持 `page`、`pageSize`；筛选接口补充 `sortBy`、`sortOrder`。
 
-### 9.2 看板快照接口
+成功响应示例：
 
-这是前端主页面的关键接口。
+```json
+{
+  "data": {
+    "id": "018f5f24-5c6d-7b9e-a69b-5fe1e14715b2",
+    "name": "Plan"
+  },
+  "meta": {
+    "requestId": "req_01hsz3m8h7"
+  }
+}
+```
 
-- `GET /api/projects/:projectId/board`
+错误响应示例：
+
+```json
+{
+  "error": {
+    "code": "validation_error",
+    "message": "title must not be empty",
+    "details": {
+      "field": "title"
+    },
+    "requestId": "req_01hsz3m8h7"
+  }
+}
+```
+
+### 9.2 核心 DTO 约定
+
+- `ProjectDto`：`id`、`name`、`slug`、`description`、`color`、`createdAt`、`updatedAt`
+- `StatusDto`：`id`、`projectId`、`name`、`color`、`sortOrder`、`isDone`、`isHidden`、`createdAt`、`updatedAt`
+- `TaskDto`：`id`、`projectId`、`statusId`、`title`、`description`、`priority`、`position`、`startDate`、`dueDate`、`completedAt`、`archivedAt`、`tagIds`、`createdAt`、`updatedAt`
+- `CommentDto`：`id`、`taskId`、`authorName`、`content`、`createdAt`、`updatedAt`
+- `TagDto`：`id`、`projectId`、`name`、`color`、`createdAt`、`updatedAt`
+
+### 9.3 项目接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/v1/projects?page=1&pageSize=20` | 获取项目列表 |
+| `POST` | `/api/v1/projects` | 创建项目，并初始化默认列 |
+| `GET` | `/api/v1/projects/{projectId}` | 获取项目详情 |
+| `PATCH` | `/api/v1/projects/{projectId}` | 更新项目 |
+| `DELETE` | `/api/v1/projects/{projectId}` | 删除项目，级联清理下游数据 |
+
+`POST /api/v1/projects` 请求体建议：
+
+```json
+{
+  "name": "Plan",
+  "slug": "plan",
+  "description": "Local kanban",
+  "color": "#2563eb"
+}
+```
+
+### 9.4 看板快照接口
+
+主看板首屏统一使用快照接口，不拆多次请求。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/v1/projects/{projectId}/board?includeArchived=false` | 获取项目看板快照 |
 
 返回建议：
 
 ```json
 {
-  "project": {},
-  "statuses": [],
-  "tasks": [],
-  "tags": [],
-  "taskTags": [],
-  "summary": {
-    "totalTasks": 0,
-    "doneTasks": 0
+  "data": {
+    "project": {},
+    "statuses": [],
+    "tasks": [],
+    "tags": [],
+    "taskTags": [],
+    "summary": {
+      "activeTaskCount": 0,
+      "doneTaskCount": 0,
+      "archivedTaskCount": 0
+    }
+  },
+  "meta": {
+    "requestId": "req_01hsz3m8h7"
   }
 }
 ```
 
-设计原因：
+设计要求：
 
-- 前端打开项目页时只需一次请求即可渲染主看板。
-- 避免项目、列、任务、标签拆成多次首屏请求。
+- 一次请求返回渲染看板所需的核心数据，避免首页 N+1 请求。
+- 响应保持扁平化和规范化，前端根据 `statusId`、`tagIds` 自行分组，不在接口层嵌套整棵列树。
+- `board` 接口服务于主视图；搜索、筛选、分页统一走任务列表接口，不再单独设计 `/search` 路径。
 
-### 9.3 状态列接口
+### 9.5 状态列接口
 
-- `GET /api/projects/:projectId/statuses`
-- `POST /api/projects/:projectId/statuses`
-- `PATCH /api/statuses/:statusId`
-- `DELETE /api/statuses/:statusId`
-- `POST /api/projects/:projectId/statuses/reorder`
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/v1/projects/{projectId}/statuses` | 获取状态列列表 |
+| `POST` | `/api/v1/projects/{projectId}/statuses` | 创建状态列 |
+| `PATCH` | `/api/v1/statuses/{statusId}` | 更新状态列 |
+| `DELETE` | `/api/v1/statuses/{statusId}` | 删除状态列，列下有未归档任务时返回 `409` |
+| `POST` | `/api/v1/projects/{projectId}/statuses/reorder` | 重排列顺序 |
 
-### 9.4 任务接口
+`POST /api/v1/projects/{projectId}/statuses/reorder` 请求体建议：
 
-- `POST /api/tasks`
-- `GET /api/tasks/:taskId`
-- `PATCH /api/tasks/:taskId`
-- `DELETE /api/tasks/:taskId`
-- `POST /api/tasks/:taskId/archive`
-- `POST /api/tasks/:taskId/restore`
+```json
+{
+  "orderedStatusIds": [
+    "status_todo",
+    "status_doing",
+    "status_done"
+  ]
+}
+```
 
-### 9.5 任务拖拽排序接口
+### 9.6 任务接口
 
-- `POST /api/tasks/reorder`
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/v1/projects/{projectId}/tasks` | 任务列表、搜索、筛选、分页 |
+| `POST` | `/api/v1/projects/{projectId}/tasks` | 创建任务 |
+| `GET` | `/api/v1/tasks/{taskId}` | 获取任务详情 |
+| `PATCH` | `/api/v1/tasks/{taskId}` | 更新任务 |
+| `DELETE` | `/api/v1/tasks/{taskId}` | 物理删除任务，仅建议用于已归档任务 |
+| `POST` | `/api/v1/tasks/{taskId}/archive` | 归档任务 |
+| `POST` | `/api/v1/tasks/{taskId}/restore` | 恢复任务 |
+
+`GET /api/v1/projects/{projectId}/tasks` 查询参数建议：
+
+- `q`：关键字，匹配标题和描述
+- `statusId`
+- `priority`
+- `tagId`
+- `archived`：`exclude | only | include`
+- `page`
+- `pageSize`
+- `sortBy`：`updatedAt | dueDate | createdAt | position`
+- `sortOrder`：`asc | desc`
+
+`POST /api/v1/projects/{projectId}/tasks` 请求体建议：
+
+```json
+{
+  "statusId": "status_todo",
+  "title": "Define backend API",
+  "description": "Finalize REST contracts for board and tasks",
+  "priority": "high",
+  "startDate": "2026-04-18",
+  "dueDate": "2026-04-21",
+  "tagIds": [
+    "tag_backend"
+  ]
+}
+```
+
+`PATCH /api/v1/tasks/{taskId}` 请求体建议：
+
+```json
+{
+  "title": "Define stable backend API",
+  "description": "Updated description",
+  "priority": "urgent",
+  "statusId": "status_doing",
+  "dueDate": null,
+  "tagIds": [
+    "tag_backend",
+    "tag_api"
+  ]
+}
+```
+
+说明：
+
+- `tagIds` 在创建和更新任务时都允许整组提交，后端在事务内做关联替换。
+- 任务进入 `isDone = true` 的列时，后端自动写入 `completedAt`；离开完成列时自动清空。
+- 常规用户流转优先使用 `archive/restore`；`DELETE` 更偏向维护接口。
+
+### 9.7 任务拖拽排序接口
+
+看板拖拽单独建接口，避免把排序语义塞进通用 `PATCH`。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/v1/projects/{projectId}/tasks/reorder` | 移动任务并重算列内顺序 |
 
 请求体建议：
 
@@ -533,58 +716,74 @@ API 风格采用 REST + JSON。
   "sourceStatusId": "status_todo",
   "destinationStatusId": "status_doing",
   "orderedTaskIds": [
-    "task_1",
     "task_2",
-    "task_3"
+    "task_xxx",
+    "task_9"
   ]
 }
 ```
 
-也可以采用批量更新方案：
+后端要求：
+
+- 在单事务内校验任务、源列、目标列都属于同一项目。
+- 重写目标列顺序；如果跨列移动，同时重写源列剩余任务顺序。
+- 只更新真实发生变化的记录，避免整列无差别写入。
+- 同步维护 `completedAt` 与 `activityLogs`。
+
+### 9.8 评论接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/v1/tasks/{taskId}/comments` | 获取评论列表，按 `createdAt ASC` |
+| `POST` | `/api/v1/tasks/{taskId}/comments` | 新增评论 |
+| `PATCH` | `/api/v1/comments/{commentId}` | 编辑评论 |
+| `DELETE` | `/api/v1/comments/{commentId}` | 删除评论 |
+
+`POST /api/v1/tasks/{taskId}/comments` 请求体建议：
 
 ```json
 {
-  "updates": [
-    { "id": "task_1", "statusId": "status_doing", "position": 1000 },
-    { "id": "task_2", "statusId": "status_doing", "position": 2000 }
-  ]
+  "authorName": "system",
+  "content": "Initial note"
 }
 ```
 
-建议后端统一在事务中完成：
+### 9.9 标签接口
 
-- 校验任务与列归属同一项目。
-- 更新跨列任务的 `status_id`。
-- 按最新顺序批量更新 `position`。
-- 写入 `activity_logs`。
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/v1/projects/{projectId}/tags` | 获取标签列表 |
+| `POST` | `/api/v1/projects/{projectId}/tags` | 创建标签 |
+| `PATCH` | `/api/v1/tags/{tagId}` | 更新标签 |
+| `DELETE` | `/api/v1/tags/{tagId}` | 删除标签 |
+| `PUT` | `/api/v1/tasks/{taskId}/tags/{tagId}` | 绑定标签，要求幂等 |
+| `DELETE` | `/api/v1/tasks/{taskId}/tags/{tagId}` | 解绑标签 |
 
-### 9.6 评论接口
+说明：
 
-- `GET /api/tasks/:taskId/comments`
-- `POST /api/tasks/:taskId/comments`
-- `PATCH /api/comments/:commentId`
-- `DELETE /api/comments/:commentId`
+- 任务标签绑定推荐使用 `PUT`，因为“绑定同一标签”天然是幂等动作。
+- 如果前端已经拿到完整 `tagIds`，优先通过 `PATCH /tasks/{taskId}` 一次性提交；`PUT/DELETE` 适合细粒度交互。
 
-### 9.7 标签接口
+### 9.10 状态码与错误码
 
-- `GET /api/projects/:projectId/tags`
-- `POST /api/projects/:projectId/tags`
-- `PATCH /api/tags/:tagId`
-- `DELETE /api/tags/:tagId`
-- `POST /api/tasks/:taskId/tags/:tagId`
-- `DELETE /api/tasks/:taskId/tags/:tagId`
+建议统一使用：
 
-### 9.8 搜索与筛选接口
+- `200 OK`：普通读取、更新、归档、恢复、重排
+- `201 Created`：创建成功
+- `204 No Content`：删除成功
+- `400 Bad Request`：JSON 结构错误、参数类型错误
+- `404 Not Found`：资源不存在
+- `409 Conflict`：唯一键冲突、删除列时仍有任务、非法状态迁移
+- `422 Unprocessable Entity`：业务字段校验失败
+- `500 Internal Server Error`：未处理错误
 
-- `GET /api/projects/:projectId/tasks/search?q=...`
+建议保留的错误码枚举：
 
-支持的筛选条件建议包括：
-
-- `status_id`
-- `priority`
-- `tag_id`
-- `is_archived`
-- `keyword`
+- `validation_error`
+- `not_found`
+- `conflict`
+- `invalid_operation`
+- `internal_error`
 
 ## 10. 前端架构设计
 
@@ -650,14 +849,14 @@ features/
 主看板加载：
 
 1. 页面进入 `/projects/[projectId]`
-2. 调用 `GET /api/projects/:projectId/board`
+2. 调用 `GET /api/v1/projects/:projectId/board`
 3. 前端按 `statuses + tasks` 分组渲染列与卡片
 4. 点击卡片后，更新 `taskId` 参数并加载任务详情
 
 拖拽任务：
 
 1. 前端本地乐观更新列内任务顺序
-2. 调用 `POST /api/tasks/reorder`
+2. 调用 `POST /api/v1/projects/:projectId/tasks/reorder`
 3. 成功则保持本地状态
 4. 失败则回滚并提示用户
 
@@ -681,6 +880,7 @@ features/
 - 解析路径参数、查询参数和 JSON body
 - 调用应用服务
 - 输出统一 JSON 响应
+- 注册 `GET /api/v1/openapi.json`，返回运行时生成的 OpenAPI 文档
 
 不负责：
 
@@ -719,21 +919,29 @@ features/
 - `ValidationError`
 - `NotFoundError`
 - `ConflictError`
+- `InvalidOperationError`
 - `InternalError`
 
 HTTP 映射：
 
-- `400`：请求参数非法
+- `400`：JSON 结构错误、参数类型错误
 - `404`：资源不存在
-- `409`：排序冲突、唯一性冲突
+- `409`：排序冲突、唯一性冲突、删除前置条件不满足
+- `422`：业务字段校验失败
 - `500`：服务内部错误
 
 错误响应示例：
 
 ```json
 {
-  "code": "validation_error",
-  "message": "title must not be empty"
+  "error": {
+    "code": "validation_error",
+    "message": "title must not be empty",
+    "details": {
+      "field": "title"
+    },
+    "requestId": "req_01hsz3m8h7"
+  }
 }
 ```
 
@@ -786,7 +994,8 @@ HTTP 映射：
 
 - Next.js 运行在 `3000`
 - Rust API 运行在 `3001`
-- 前端通过 `next.config.ts` rewrites 代理 `/api/*`
+- 前端通过 `next.config.ts` rewrites 代理 `/api/v1/*`
+- 后端提供 `GET /api/v1/openapi.json` 供前端联调、Mock 和调试使用
 
 ### 13.2 生产部署
 
@@ -813,12 +1022,19 @@ HTTP 映射：
 - 所有更新时间使用服务端时间，不信任前端传入。
 - 删除操作建议优先归档而不是物理删除。
 - 数据库定期备份，后续可加导出能力。
+- OpenAPI JSON 必须由代码自动导出，避免人工维护的契约漂移。
 
 对于 SQLite 运行建议：
 
 - 开启 WAL 模式。
 - 统一通过连接池访问数据库。
 - 启动时自动执行 migration。
+
+对 OpenAPI 运行建议：
+
+- 启动时注册 `GET /api/v1/openapi.json`
+- 提供独立导出命令生成 `api/docs/openapi.json`
+- 在 CI 中校验 `api/docs/openapi.json` 是否与当前代码生成结果一致
 
 ## 15. 开发阶段规划
 

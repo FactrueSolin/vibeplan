@@ -560,7 +560,127 @@ PRAGMA busy_timeout = 5000;
 - `WAL` 更适合本地应用的读写并发
 - `busy_timeout` 可以降低短时写锁导致的失败概率
 
-## 11. 最终结论
+## 11. API 与数据层映射建议
+
+### 11.1 DTO 与表字段映射
+
+- API 层统一输出 `camelCase`，数据库字段维持 `snake_case`
+- `ProjectDto` 对应 `projects`
+- `StatusDto` 对应 `task_statuses`
+- `TaskDto` 对应 `tasks`，`tagIds` 通过 `task_tags` 聚合得到
+- `CommentDto` 对应 `task_comments`
+- `TagDto` 对应 `tags`
+
+建议：
+
+- `entity` 只负责表结构映射
+- `dto` 负责对外 JSON 结构
+- `repository` 负责把多表结果组装成 DTO 所需中间结构
+- `app service` 负责最终响应组合与事务边界
+
+### 11.2 看板快照接口
+
+接口：`GET /api/v1/projects/{projectId}/board`
+
+推荐查询方式：
+
+1. 读取 `projects` 单条记录
+2. 按 `sort_order ASC` 读取 `task_statuses`
+3. 按 `(status_id, position ASC)` 读取未归档 `tasks`
+4. 读取项目下全部 `tags`
+5. 按任务集合批量读取 `task_tags`
+
+实现要求：
+
+- 不要按列逐个查询任务，避免形成 N+1
+- 该接口返回规范化结果，不在 SQL 层拼嵌套 JSON
+- 主查询命中索引应以 `idx_task_statuses_project_sort`、`idx_tasks_active_board`、`idx_task_tags_project_tag` 为主
+
+### 11.3 任务列表与筛选接口
+
+接口：`GET /api/v1/projects/{projectId}/tasks`
+
+推荐策略：
+
+- 固定条件始终包含 `project_id`
+- `archived=exclude` 时优先命中 `idx_tasks_active_updated_at`
+- 存在 `statusId` 时走 `(project_id, status_id, position)` 索引
+- 存在 `tagId` 时再联结 `task_tags`
+- 关键字搜索 V1 使用 `title LIKE ? OR description LIKE ?` 即可，暂不引入 FTS
+
+说明：
+
+- 当前数据规模预计不大，先保证查询逻辑清晰
+- 如果后续搜索体验成为瓶颈，再单独评估 SQLite FTS5，而不是在 V1 预埋复杂方案
+
+### 11.4 创建与更新任务
+
+接口：
+
+- `POST /api/v1/projects/{projectId}/tasks`
+- `PATCH /api/v1/tasks/{taskId}`
+
+推荐事务步骤：
+
+1. 校验 `status_id` 属于目标项目
+2. 创建任务时读取目标列尾部 `MAX(position)`，用稀疏步长生成新位置
+3. 插入或更新 `tasks`
+4. 如果请求携带 `tagIds`，则在同一事务中写入或替换 `task_tags`
+5. 如果任务进入或离开完成列，同步维护 `completed_at`
+6. 写入 `activity_logs`
+
+实现建议：
+
+- `PATCH` 只更新显式传入字段
+- `tagIds` 采用“全集替换”更易保持一致性
+- 若未来出现多端同时编辑，再补 `revision` 或 `updated_at` 条件更新；V1 先不引入乐观锁字段
+
+### 11.5 拖拽重排接口
+
+接口：`POST /api/v1/projects/{projectId}/tasks/reorder`
+
+推荐事务步骤：
+
+1. 校验 `moved_task_id`、源列、目标列都属于同一项目
+2. 读取源列与目标列当前有效任务集合
+3. 根据前端提交的 `orderedTaskIds` 重算目标列 `position`
+4. 若跨列移动，重算源列剩余任务的 `position`
+5. 批量更新变化记录，并同步更新 `status_id`
+6. 写入一条 `activity_logs`，记录移动前后列和顺序
+
+实现要求：
+
+- 只更新位置确实变化的任务
+- 重排时统一写回 `1000` 步长，避免位置越来越稠密
+- 该接口必须由应用服务显式包事务，不要把逻辑分散到多个 repository 调用后各自提交
+
+### 11.6 状态列与标签相关接口
+
+状态列：
+
+- `DELETE /api/v1/statuses/{statusId}` 之前，先检查该列是否仍有未归档任务
+- `POST /api/v1/projects/{projectId}/statuses/reorder` 只重写 `task_statuses.sort_order`
+
+标签：
+
+- `PUT /api/v1/tasks/{taskId}/tags/{tagId}` 可使用“先查后插”或 SQLite `INSERT OR IGNORE`
+- `DELETE /api/v1/tasks/{taskId}/tags/{tagId}` 直接按主键删除
+- 因为 `task_tags` 带 `project_id` 组合外键，所以跨项目误绑定会直接失败
+
+### 11.7 评论与活动日志
+
+评论：
+
+- `GET /api/v1/tasks/{taskId}/comments` 按 `created_at ASC` 查询
+- `POST /api/v1/tasks/{taskId}/comments`、`PATCH /api/v1/comments/{commentId}`、`DELETE /api/v1/comments/{commentId}` 都建议补写 `activity_logs`
+
+活动日志：
+
+- `activity_logs` 是审计与时间线基础表，不要求强枚举
+- `payload_json` 建议记录最小必要上下文，例如 `fromStatusId`、`toStatusId`、`changedFields`
+- 不要在 repository 层隐式写日志，统一由应用服务显式调用，避免副作用分散
+
+## 12. 最终结论
 
 对于 `plan` 的 V1，最稳妥的数据库方案是：
 
