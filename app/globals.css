@@ -1,18 +1,25 @@
-@import "tailwindcss";
+@import 'tailwindcss';
 
 :root {
-  --page: #f4ede2;
-  --paper: #fcf5ea;
-  --panel: #fff9f1;
-  --panel-strong: #f1e4d4;
-  --ink: #23180f;
-  --ink-soft: #6d5a4c;
-  --line-soft: rgba(109, 90, 76, 0.14);
-  --accent-ember: #e76f43;
-  --accent-ember-strong: #b84b26;
-  --accent-teal: #2d7e71;
-  --accent-teal-strong: #1f5a52;
-  --accent-olive-strong: #58694a;
+  --page: #efe8dc;
+  --paper: #f7f1e7;
+  --panel: rgba(255, 250, 241, 0.88);
+  --panel-strong: #f0e3d0;
+  --panel-soft: #fffaf3;
+  --ink: #21170f;
+  --ink-soft: #6f604f;
+  --ink-faint: #9d8a76;
+  --line-soft: rgba(91, 73, 57, 0.14);
+  --line-strong: rgba(91, 73, 57, 0.24);
+  --accent: #c76637;
+  --accent-strong: #974b25;
+  --teal: #2f7f74;
+  --teal-strong: #215a52;
+  --olive: #72865b;
+  --danger: #a74237;
+  --warning: #db9c2a;
+  --success: #4a7f45;
+  --shadow: 0 22px 60px rgba(50, 34, 18, 0.12);
 }
 
 @theme inline {
@@ -28,33 +35,46 @@
 
 html {
   background:
-    radial-gradient(circle at top left, rgba(231, 111, 67, 0.18), transparent 28%),
-    radial-gradient(circle at right 20%, rgba(45, 126, 113, 0.12), transparent 24%),
-    linear-gradient(180deg, #f8f0e5 0%, #efe5d9 100%);
+    radial-gradient(circle at top left, rgba(199, 102, 55, 0.18), transparent 24%),
+    radial-gradient(circle at right 12%, rgba(47, 127, 116, 0.14), transparent 20%),
+    linear-gradient(180deg, #f6efe4 0%, #efe8dc 100%);
 }
 
 body {
   min-height: 100vh;
-  background:
-    radial-gradient(circle at top, rgba(255, 255, 255, 0.52), transparent 35%),
-    linear-gradient(180deg, rgba(255, 247, 238, 0.82), rgba(244, 237, 226, 0.96));
+  margin: 0;
   color: var(--ink);
   font-family: var(--font-space-grotesk), sans-serif;
+  background:
+    linear-gradient(180deg, rgba(255, 250, 242, 0.55), rgba(239, 232, 220, 0.72)),
+    radial-gradient(circle at top, rgba(255, 255, 255, 0.5), transparent 38%);
 }
 
 body::before {
-  content: "";
+  content: '';
   position: fixed;
   inset: 0;
   pointer-events: none;
   background-image:
-    linear-gradient(rgba(109, 90, 76, 0.03) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(109, 90, 76, 0.03) 1px, transparent 1px);
-  background-size: 120px 120px;
-  mask-image: radial-gradient(circle at center, black 42%, transparent 85%);
+    linear-gradient(rgba(73, 53, 34, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(73, 53, 34, 0.03) 1px, transparent 1px);
+  background-size: 104px 104px;
+  mask-image: radial-gradient(circle at center, black 44%, transparent 84%);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
 }
 
 ::selection {
-  background: rgba(231, 111, 67, 0.22);
+  background: rgba(199, 102, 55, 0.2);
   color: var(--ink);
 }
